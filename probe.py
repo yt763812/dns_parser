@@ -1,89 +1,178 @@
+"""DNS Belarus catalogue diagnostic (Railway / Playwright).
+
+Reads five categories, up to two pages each by default. No database writes.
+Environment: MAX_PAGES=2, MAX_ITEMS_LOG=15, PAGE_DELAY_MS=1200.
+"""
 import asyncio
 import json
 import os
 import re
-from urllib.parse import quote_plus
-
+from urllib.parse import urljoin, urlparse, parse_qs
 from playwright.async_api import async_playwright
 
-QUERY = os.getenv("SEARCH_QUERY", "iphone 16")
-LIMIT = int(os.getenv("RESULT_LIMIT", "10"))
-URL = "https://dns-shop.by/ru/search/?q=" + quote_plus(QUERY)
+BASE = 'https://dns-shop.by'
+MAX_PAGES = max(1, min(int(os.getenv('MAX_PAGES', '2')), 100))
+MAX_ITEMS_LOG = max(0, int(os.getenv('MAX_ITEMS_LOG', '15')))
+DELAY = max(500, int(os.getenv('PAGE_DELAY_MS', '1200')))
+CATEGORIES = {
+    'smartphones': ('смартфоны', ['смартфон']),
+    'tablets': ('планшеты', ['планшет']),
+    'laptops': ('ноутбуки', ['ноутбук']),
+    'smartwatches': ('смарт-часы', ['смарт-час', 'умные часы', 'умные-часы']),
+    'headphones': ('наушники', ['наушник']),
+}
+PRICE_RE = re.compile(r'(\d[\d\s\u00a0\u202f]*[.,]\d{2})\s*BYN', re.I)
 
-EXTRACT_JS = r"""() => {
-  const links = [...document.querySelectorAll('a[href*="/product/"]')];
+# Extract from a product anchor and its closest likely listing card.
+EXTRACT_JS = r'''() => {
+  const anchors = [...document.querySelectorAll('a[href*="/product/"]')];
+  const output = [];
   const seen = new Set();
-  const results = [];
-  const pricePattern = /(?:\d[\d\s\u00a0\u202f]{0,12}[,.]\d{2}|\d[\d\s\u00a0\u202f]{1,12})\s*(?:р\.|руб\.?|BYN|Br|₽)/i;
-  for (const link of links) {
-    const url = new URL(link.getAttribute('href'), location.href).href.split('#')[0];
-    if (seen.has(url)) continue;
-    seen.add(url);
-    const img = link.querySelector('img');
-    let name = (link.innerText || link.getAttribute('title') || img?.alt || '').trim().replace(/\s+/g, ' ');
-    let card = link;
-    for (let i = 0; i < 5 && card.parentElement; i++) {
-      card = card.parentElement;
-      const text = (card.innerText || '').trim();
-      if (text.length > 35 && text.length < 1500 && (pricePattern.test(text) || card.querySelector('[class*="price"]'))) break;
+  for (const a of anchors) {
+    const href = a.href.split('?')[0].split('#')[0];
+    if (!/^https:\/\/dns-shop\.by\/ru\/product\//.test(href) || seen.has(href)) continue;
+    let el = a;
+    let card = null;
+    for (let i = 0; i < 7 && el; i++, el = el.parentElement) {
+      const t = (el.innerText || '').trim();
+      if (t.length > 20 && t.length < 2500 && /\d[\d\s.,]*\s*BYN/i.test(t)) {
+        card = el;
+        break;
+      }
     }
-    const text = (card.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 650);
-    if (!name || name.length < 8) {
-      const candidate = card.querySelector('[class*="title"], [class*="name"], h2, h3');
-      name = (candidate?.innerText || img?.alt || '').trim().replace(/\s+/g, ' ');
-    }
-    const priceEl = card.querySelector('[class*="price"]');
-    const priceText = (priceEl?.innerText || '').replace(/\s+/g, ' ').trim();
-    const match = (priceText || text).match(pricePattern);
-    results.push({name: name.slice(0, 200), url, price: match?.[0] || null, price_text: priceText.slice(0, 150), snippet: text.slice(0, 250)});
+    if (!card) continue;
+    const raw = (card.innerText || '').replace(/\s+/g, ' ').trim();
+    const name = (a.innerText || a.getAttribute('title') || '').replace(/\s+/g, ' ').trim();
+    if (!name || name.length < 8) continue;
+    const prices = [...raw.matchAll(/(\d[\d\s\u00a0\u202f]*[.,]\d{2})\s*BYN/gi)].map(m => m[1]);
+    if (!prices.length) continue;
+    seen.add(href);
+    output.push({name, url: href, price_candidates: prices, card_sample: raw.slice(0, 230)});
   }
-  return results;
-}"""
+  return output;
+}'''
 
+async def discover_categories(page):
+    """Find category URLs from the site's own navigation; never guess slugs."""
+    await page.goto(BASE + '/ru/', wait_until='domcontentloaded', timeout=45000)
+    await page.wait_for_timeout(1600)
+    # Category menu may require a click.
+    for selector in ['text=Каталог', 'a:has-text("Каталог")', 'button:has-text("Каталог")']:
+        try:
+            loc = page.locator(selector).first
+            if await loc.count():
+                await loc.click(timeout=2000)
+                await page.wait_for_timeout(900)
+                break
+        except Exception:
+            continue
+    links = await page.locator('a[href]').evaluate_all('''els => els.map(a => ({text:(a.innerText||a.title||'').trim(), href:a.href}))''')
+    found = {}
+    for key, (label, tokens) in CATEGORIES.items():
+        matches = []
+        for link in links:
+            text = ' '.join(link['text'].lower().split())
+            href = link['href']
+            if not href.startswith(BASE + '/ru/catalog/'):
+                continue
+            if any(token in text for token in tokens):
+                # Prefer exact category text; reject obvious broad category labels.
+                score = (100 if text == label else 0) - len(text)
+                matches.append((score, href, text))
+        if matches:
+            matches.sort(reverse=True)
+            found[key] = matches[0][1]
+            print(f'CATEGORY_DISCOVERED {key}: {found[key]} (label={matches[0][2]!r})', flush=True)
+        else:
+            print(f'CATEGORY_NOT_FOUND {key}: navigation did not expose a matching catalogue link', flush=True)
+    return found
 
-def matches_query(name: str, query: str) -> bool:
-    tokens = re.findall(r"[\w]+", query.casefold())
-    normalized = name.casefold()
-    return bool(name) and all(token in normalized for token in tokens)
+async def next_page_url(page, visited):
+    """Only follow an explicit next-page control, not an assumed ?p= scheme."""
+    candidates = await page.locator('a[href]').evaluate_all('''els => els.map(a => ({
+      href:a.href, text:(a.innerText||'').trim(), aria:(a.getAttribute('aria-label')||''),
+      rel:(a.getAttribute('rel')||''), cls:(typeof a.className==='string'?a.className:'')
+    }))''')
+    for a in candidates:
+        signals = ' '.join((a['text'], a['aria'], a['rel'], a['cls'])).lower()
+        if not (a['rel'].lower() == 'next' or re.search(r'следующ|впер[её]д|next|pagination.*next|page.*next', signals)):
+            continue
+        url = a['href'].split('#')[0]
+        if url.startswith(BASE + '/ru/catalog/') and url not in visited:
+            return url
+    return None
 
+def price_value(raw):
+    # Accept a decimal price only; don't confuse crossed-out price with sale price.
+    return float(raw.replace(' ', '').replace('\u00a0', '').replace('\u202f', '').replace(',', '.'))
 
 async def main():
-    print(f"DNS product diagnostic | query={QUERY!r} | no database access", flush=True)
-    print(f"Search URL: {URL}", flush=True)
-    async with async_playwright() as playwright:
-        browser = await playwright.chromium.launch(headless=True, args=["--no-sandbox"])
-        page = await browser.new_page(locale="ru-RU", viewport={"width": 1365, "height": 900})
+    print(f'DNS CATALOG DIAGNOSTIC | MAX_PAGES={MAX_PAGES} | NO DATABASE', flush=True)
+    all_products = {}
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True, args=['--no-sandbox'])
+        context = await browser.new_context(locale='ru-RU', viewport={'width': 1440, 'height': 900})
+        page = await context.new_page()
         try:
-            response = await page.goto(URL, wait_until="domcontentloaded", timeout=45000)
-            print(f"HTTP status: {response.status if response else 'no response'}", flush=True)
-            try:
-                await page.locator('a[href*="/product/"]').first.wait_for(timeout=20000)
-            except Exception:
-                print("No product links appeared within 20 seconds", flush=True)
-            await page.wait_for_timeout(2500)
-            print(f"Page title: {await page.title()}", flush=True)
-            print(f"Final URL: {page.url}", flush=True)
-            products = await page.evaluate(EXTRACT_JS)
-            print(f"Unique product URLs: {len(products)}", flush=True)
-            matched = [p for p in products if matches_query(p['name'], QUERY)]
-            print(f"Name matches: {len(matched)}", flush=True)
-            selected = matched[:LIMIT] if matched else products[:LIMIT]
-            if not matched:
-                print("WARNING: No product names matched all search words; showing diagnostic candidates", flush=True)
-            for i, item in enumerate(selected, 1):
-                print(f"\nPRODUCT {i}", flush=True)
-                print(f"  Name: {item['name'] or '(not extracted)'}", flush=True)
-                print(f"  Price candidate: {item['price'] or '(not found)'}", flush=True)
-                print(f"  URL: {item['url']}", flush=True)
-                print(f"  Card text: {item['snippet']}", flush=True)
-            print("\nRESULT: " + ("MATCHED_PRODUCTS_FOUND" if matched else "NEEDS_SELECTOR_REVIEW"), flush=True)
-            print("NOTE: Price candidates are unverified until compared with the product page.", flush=True)
+            categories = await discover_categories(page)
+            for key, (label, _) in CATEGORIES.items():
+                print(f'\n=== {label.upper()} ===', flush=True)
+                start_url = categories.get(key)
+                if not start_url:
+                    print('STATUS: SKIPPED (category URL not discovered)', flush=True)
+                    continue
+                visited = set()
+                current = start_url
+                count = 0
+                while current and count < MAX_PAGES:
+                    if current in visited:
+                        break
+                    visited.add(current)
+                    try:
+                        response = await page.goto(current, wait_until='domcontentloaded', timeout=45000)
+                        await page.wait_for_timeout(DELAY)
+                        status = response.status if response else 'unknown'
+                        if status != 200:
+                            print(f'PAGE_ERROR status={status} url={current}', flush=True)
+                            break
+                        items = await page.evaluate(EXTRACT_JS)
+                        print(f'PAGE {count + 1}: http={status} extracted={len(items)} url={page.url}', flush=True)
+                        if not items:
+                            print('WARNING: No priced product cards found; inspect markup / possible block.', flush=True)
+                            break
+                        for item in items:
+                            if item['url'] in all_products:
+                                continue
+                            try:
+                                # Usually only current price has BYN suffix; when multiple, keep last and flag.
+                                prices = [price_value(x) for x in item['price_candidates']]
+                                price = prices[-1]
+                            except ValueError:
+                                continue
+                            all_products[item['url']] = {'category': key, 'name': item['name'], 'price': price,
+                                                         'currency': 'BYN', 'source': 'dns-shop.by', 'url': item['url']}
+                            if sum(1 for v in all_products.values() if v['category'] == key) <= MAX_ITEMS_LOG:
+                                print('ITEM ' + json.dumps(all_products[item['url']], ensure_ascii=False), flush=True)
+                            if len(prices) > 1:
+                                print(f'PRICE_REVIEW multiple candidates={prices} url={item["url"]}', flush=True)
+                        count += 1
+                        next_url = await next_page_url(page, visited)
+                        if count < MAX_PAGES and not next_url:
+                            print('PAGINATION_NOT_FOUND: no explicit next-page link; cannot confirm catalogue completeness.', flush=True)
+                        current = next_url
+                    except Exception as exc:
+                        print(f'PAGE_EXCEPTION {type(exc).__name__}: {str(exc)[:300]}', flush=True)
+                        break
+                n = sum(v['category'] == key for v in all_products.values())
+                print(f'CATEGORY_SUMMARY category={key} pages={count} unique_items={n}', flush=True)
+            print('\n=== TOTAL ===', flush=True)
+            print(f'UNIQUE_ITEMS={len(all_products)}', flush=True)
+            print('RESULT: DIAGNOSTIC_FINISHED (not a completeness guarantee)', flush=True)
         except Exception as exc:
-            print(f"TEST ERROR: {type(exc).__name__}: {str(exc)[:600]}", flush=True)
+            print(f'FATAL_ERROR {type(exc).__name__}: {str(exc)[:500]}', flush=True)
             raise
         finally:
             await browser.close()
 
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     asyncio.run(main())
